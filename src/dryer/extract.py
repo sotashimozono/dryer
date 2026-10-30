@@ -3,7 +3,9 @@
 Clojure compares every top-level list except `ns`, matching dry4clj. The other
 languages compare the functions and methods crapper scores: bodies, not
 signatures alone, and not callbacks nested inside another function. Rust
-functions inside `mod tests` are test code and are skipped.
+functions inside `mod tests` are test code and are skipped. Julia compares
+`function` and `macro` definitions with a body and one-line `f(x) = ...`
+definitions.
 """
 
 from __future__ import annotations
@@ -143,12 +145,54 @@ def _rust_nodes(data: bytes, root) -> list:
     return found
 
 
+_JULIA_DEFINITIONS = {"function_definition", "macro_definition"}
+_JULIA_CLOSURES = {"arrow_function_expression", "do_clause"}
+
+
+def _julia_short_head(node) -> bool:
+    """`f(x)`, `f(x)::T` or `f(x) where T`: the left side of a one-line definition."""
+
+    while node is not None and node.type in {"typed_expression", "where_expression"}:
+        node = node.named_children[0] if node.named_children else None
+    return node is not None and node.type == "call_expression"
+
+
+def _julia_short_definition(node) -> bool:
+    if node.type != "assignment" or not node.named_children:
+        return False
+    return _julia_short_head(node.named_children[0])
+
+
+def _julia_nested(node) -> bool:
+    current = node.parent
+    while current is not None:
+        if current.type in _JULIA_DEFINITIONS or current.type in _JULIA_CLOSURES:
+            return True
+        if _julia_short_definition(current):
+            return True
+        current = current.parent
+    return False
+
+
+def _julia_nodes(data: bytes, root) -> list:
+    found = []
+    for node in descendants(root):
+        if node.type in _JULIA_DEFINITIONS:
+            keep = _has(node, "block")
+        else:
+            keep = _julia_short_definition(node)
+        if keep and not _julia_nested(node):
+            found.append(node)
+    return found
+
+
 _PICKERS = {
     "java": ("java", _java_nodes),
     "go": ("go", _go_nodes),
     "python": ("python", _python_nodes),
     "typescript": (_grammar, _typescript_nodes),
     "rust": ("rust", _rust_nodes),
+    "julia": ("julia", _julia_nodes),
 }
 
 

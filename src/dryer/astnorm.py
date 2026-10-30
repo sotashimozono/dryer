@@ -28,6 +28,7 @@ _IDENTIFIERS = {
     "shorthand_property_identifier",
     "shorthand_property_identifier_pattern",
     "package_identifier",
+    "macro_identifier",
 }
 
 _LITERALS = {
@@ -119,6 +120,8 @@ _CALLS = {
     "method_invocation",
     "object_creation_expression",
     "new_expression",
+    "broadcast_call_expression",
+    "macrocall_expression",
 }
 
 _ATTRIBUTES = {
@@ -134,7 +137,8 @@ _SCOPED = {
     "scoped_type_identifier",
 }
 
-_ARG_LISTS = {"argument_list", "arguments"}
+_ARG_LISTS = {"argument_list", "arguments", "macro_argument_list"}
+_INTERPOLATIONS = {"interpolation", "string_interpolation"}
 _TYPE_ARGS = {"type_arguments", "type_parameters"}
 
 _DATA: bytes = b""
@@ -158,18 +162,21 @@ _PENDING = object()
 def _is_literal(node) -> bool:
     if node.type not in _LITERALS:
         return False
-    if node.type == "string" and any(child.type == "interpolation" for child in node.children):
+    if any(child.type in _INTERPOLATIONS for child in node.children):
         return False
     return True
 
 
 def _named_before_args(node):
+    """Receivers and callee, the argument list, and what follows it (a Julia `do`)."""
+
     incoming = []
-    for child in node.named_children:
+    named = list(node.named_children)
+    for index, child in enumerate(named):
         if child.type in _ARG_LISTS:
-            return incoming, child
+            return incoming, child, named[index + 1 :]
         incoming.append(child)
-    return incoming, None
+    return incoming, None, []
 
 
 def _without_type_args(nodes):
@@ -203,13 +210,16 @@ def _try_leaf(node, mode: str, head: bool):
         return None
     if node.type in _OPERATORS:
         return [K("symbol"), node.type]
+    if node.type == "operator":
+        # Julia names every operator token `operator`; the spelling is the operation.
+        return [K("symbol"), _text(node)]
     if not node.is_named:
         return None
     return _named_leaf(node, head)
 
 
 def _call_jobs(node):
-    incoming, args = _named_before_args(node)
+    incoming, args, trailing = _named_before_args(node)
     rest, type_args = _without_type_args(incoming)
     jobs = []
     if rest:
@@ -219,6 +229,7 @@ def _call_jobs(node):
     jobs.extend((child, "norm", False) for child in type_args)
     if args is not None:
         jobs.append((args, "norm", False))
+    jobs.extend((child, "norm", False) for child in trailing)
     return jobs
 
 
@@ -257,6 +268,31 @@ def _callee_jobs(node):
     return [(node, "norm", True)]
 
 
+def _defines(node) -> bool:
+    """Julia spells a definition's head as a call: `function f(x)` and `f(x) = ...`.
+
+    The name being defined is a local name, not a callee.
+    """
+
+    if node.type != "call_expression":
+        return False
+    current = node
+    while current.parent is not None and current.parent.type in {"typed_expression", "where_expression"}:
+        if current.parent.named_children[0] != current:
+            return False
+        current = current.parent
+    parent = current.parent
+    if parent is None:
+        return False
+    if parent.type == "signature":
+        return True
+    return parent.type == "assignment" and parent.named_children[0] == current
+
+
+def _is_call(node) -> bool:
+    return node.type in _CALLS and not _defines(node)
+
+
 def _jobs(node, mode: str, head: bool):
     if mode == "callee":
         return _callee_jobs(node)
@@ -264,7 +300,7 @@ def _jobs(node, mode: str, head: bool):
         return _path_jobs(node)
     if node.type == "parenthesized_expression" and len(node.named_children) == 1:
         return [(node.named_children[0], "norm", head)]
-    if node.type in _CALLS:
+    if _is_call(node):
         return _call_jobs(node)
     if node.type in _ATTRIBUTES:
         return _attr_jobs(node, head)
@@ -284,7 +320,7 @@ def _name_value(name, head: bool, cache):
 
 
 def _assemble_call(node, cache):
-    incoming, args = _named_before_args(node)
+    incoming, args, trailing = _named_before_args(node)
     rest, type_args = _without_type_args(incoming)
     out = [K(node.type)]
     if rest:
@@ -298,8 +334,8 @@ def _assemble_call(node, cache):
         norm = cache[(id(child), "norm", False)]
         if norm is not None:
             out.append(norm)
-    if args is not None:
-        norm = cache[(id(args), "norm", False)]
+    for child in ([args] if args is not None else []) + trailing:
+        norm = cache[(id(child), "norm", False)]
         if norm is not None:
             out.append(norm)
     return out
@@ -362,7 +398,7 @@ def _assemble(node, mode: str, head: bool, cache):
     if node.type == "parenthesized_expression" and len(node.named_children) == 1:
         child = node.named_children[0]
         return cache[(id(child), "norm", head)]
-    if node.type in _CALLS:
+    if _is_call(node):
         return _assemble_call(node, cache)
     if node.type in _ATTRIBUTES:
         return _assemble_attr(node, head, cache)
